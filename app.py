@@ -788,12 +788,7 @@ if df_mahasiswa is not None and df_komunitas is not None:
                     
                     # Prediksi rating menggunakan weighted sum algorithm
                     sample_user_idx = 0
-                    sample_user_cf_steps = {
-                        "user": "",
-                        "similarity": {},
-                        "denominator": 0,
-                        "weighted_ratings": {}
-                    }
+                    sample_user_cf_steps = None
                     
                     kom_ids = df_komunitas["id_komunitas"].tolist()
                     
@@ -841,7 +836,7 @@ if df_mahasiswa is not None and df_komunitas is not None:
             st.success("✅ Perhitungan Collaborative Filtering selesai!")
             
             # Tampilkan sample calculation jika diminta
-            if show_calc_steps and sample_user_cf_steps:
+            if show_calc_steps and 'sample_user_cf_steps' in locals() and sample_user_cf_steps:
                 with st.expander("Sample CF Calculation Steps"):
                     st.write(f"**User: {sample_user_cf_steps['user']}**")
                     
@@ -1182,3 +1177,449 @@ if df_mahasiswa is not None and df_komunitas is not None:
                         st.divider()
         else:
             st.warning("Tidak ada rekomendasi yang dihasilkan. Periksa data input.")
+
+# ======================================================
+# EVALUATION FUNCTIONS
+# ======================================================
+
+def calculate_precision_at_k(actual, predicted, k):
+    """
+    Menghitung precision@k untuk rekomendasi
+    
+    Args:
+        actual: List item yang relevan/disukai pengguna
+        predicted: List item yang direkomendasikan sistem
+        k: Jumlah top rekomendasi yang dipertimbangkan
+        
+    Returns:
+        Precision@k
+    """
+    if len(predicted) > k:
+        predicted = predicted[:k]
+    
+    hits = 0
+    for item in predicted:
+        if item in actual:
+            hits += 1
+    
+    # Precision@k = jumlah item relevan yang direkomendasikan / k
+    return hits / min(k, len(predicted)) if len(predicted) > 0 else 0
+
+
+def calculate_average_precision(actual, predicted, k=None):
+    """
+    Menghitung Average Precision untuk satu pengguna
+    
+    Args:
+        actual: List item yang relevan/disukai pengguna
+        predicted: List item yang direkomendasikan sistem
+        k: Jumlah top rekomendasi yang dipertimbangkan (default: semua)
+        
+    Returns:
+        Average Precision
+    """
+    if k is None:
+        k = len(predicted)
+    predicted = predicted[:k]
+    
+    score = 0.0
+    num_hits = 0.0
+    
+    for i, item in enumerate(predicted):
+        # Jika item yang direkomendasikan adalah item yang relevan
+        if item in actual:
+            num_hits += 1
+            # Precision@i+1: berapa proporsi item yang relevan sampai posisi i+1
+            precision_at_i = num_hits / (i + 1)
+            score += precision_at_i
+    
+    # Average Precision = sum(precision@i) / jumlah item yang relevan
+    return score / min(len(actual), k) if min(len(actual), k) > 0 else 0
+
+
+def calculate_map(actuals, predicteds, k=5):
+    """
+    Menghitung Mean Average Precision (MAP) untuk seluruh pengguna
+    
+    Args:
+        actuals: Dictionary dengan key=user_id, value=list of item yang relevan
+        predicteds: Dictionary dengan key=user_id, value=list of item yang direkomendasikan
+        k: Jumlah top rekomendasi yang dipertimbangkan
+        
+    Returns:
+        Mean Average Precision (MAP)
+    """
+    aps = []
+    
+    # Untuk setiap pengguna
+    for user_id in actuals.keys():
+        if user_id in predicteds:
+            ap = calculate_average_precision(actuals[user_id], predicteds[user_id], k)
+            aps.append(ap)
+    
+    # MAP = rata-rata dari semua Average Precision
+    return sum(aps) / len(aps) if len(aps) > 0 else 0
+
+
+def prepare_ground_truth(df_mahasiswa, threshold=3.0):
+    """
+    Menyiapkan ground truth - item yang disukai/relevan bagi setiap pengguna
+    berdasarkan rating yang diberikan pengguna
+    
+    Args:
+        df_mahasiswa: DataFrame yang berisi rating pengguna
+        threshold: Batas minimum rating untuk dianggap relevan/disukai
+        
+    Returns:
+        Dictionary dengan key=user_id, value=list komunitas yang relevan
+    """
+    ground_truth = {}
+    
+    # Mencari kolom rating
+    rating_cols = [col for col in df_mahasiswa.columns if 'Rating' in col]
+    
+    # Untuk setiap mahasiswa
+    for idx, row in df_mahasiswa.iterrows():
+        user_id = row['id_mahasiswa']
+        liked_communities = []
+        
+        # Untuk setiap kolom rating
+        for col in rating_cols:
+            # Jika rating di atas threshold, anggap sebagai item yang disukai
+            if row[col] >= threshold:
+                # Ekstrak nama komunitas dari kolom rating
+                if '[' in col and ']' in col:
+                    community = col.split('[')[1].split(']')[0].strip()
+                    liked_communities.append(community)
+                elif '_' in col:  # Format Rating_GDSC
+                    community = col.split('_')[1]
+                    liked_communities.append(community)
+        
+        # Simpan daftar komunitas yang disukai pengguna
+        ground_truth[user_id] = liked_communities
+    
+    return ground_truth
+
+def prepare_ground_truth_from_joined(df_mahasiswa, community_column_name, take_first_only=True):
+    """
+    Menyiapkan ground truth berdasarkan kolom komunitas yang diikuti mahasiswa
+    
+    Args:
+        df_mahasiswa: DataFrame yang berisi data mahasiswa
+        community_column_name: Nama kolom yang berisi komunitas yang diikuti
+        take_first_only: Jika True, hanya ambil komunitas pertama dari daftar
+        
+    Returns:
+        Dictionary dengan key=user_id, value=list komunitas yang diikuti
+    """
+    ground_truth = {}
+    
+    # Untuk setiap mahasiswa
+    for idx, row in df_mahasiswa.iterrows():
+        user_id = row['id_mahasiswa']
+        
+        # Ambil daftar komunitas yang diikuti
+        if pd.notna(row[community_column_name]):
+            if isinstance(row[community_column_name], list):
+                # Jika sudah berbentuk list
+                joined_communities = row[community_column_name]
+            elif isinstance(row[community_column_name], str):
+                # Jika masih berbentuk string, pisahkan berdasarkan delimiter
+                # Gunakan delimiter yang sesuai dengan format data Anda (misalnya koma, titik koma, dll)
+                joined_communities = [comm.strip() for comm in row[community_column_name].split(',')]
+            else:
+                joined_communities = []
+        else:
+            joined_communities = []
+        
+        # Jika diminta hanya mengambil komunitas pertama dan ada komunitas yang diikuti
+        if take_first_only and joined_communities:
+            joined_communities = [joined_communities[0]]
+        
+        # Simpan daftar komunitas yang diikuti sebagai ground truth
+        ground_truth[user_id] = joined_communities
+    
+    return ground_truth
+
+def evaluate_recommendations_from_joined(df_mahasiswa, df_komunitas, hybrid_scores, community_column, k=5, take_first_only=True):
+    """
+    Mengevaluasi hasil rekomendasi menggunakan Mean Average Precision (MAP)
+    dengan ground truth dari kolom komunitas yang diikuti
+    
+    Args:
+        df_mahasiswa: DataFrame yang berisi data mahasiswa
+        df_komunitas: DataFrame yang berisi data komunitas
+        hybrid_scores: Matrix skor hasil hybrid filtering
+        community_column: Nama kolom yang berisi daftar komunitas yang diikuti
+        k: Jumlah top rekomendasi yang dievaluasi
+        take_first_only: Jika True, hanya ambil komunitas pertama dari daftar
+        
+    Returns:
+        Dictionary berisi metrik evaluasi
+    """
+    # Siapkan ground truth dari kolom komunitas yang diikuti
+    ground_truth = prepare_ground_truth_from_joined(df_mahasiswa, community_column, take_first_only)
+    
+    # Siapkan hasil rekomendasi untuk setiap pengguna
+    recommendations = {}
+    
+    # Untuk setiap mahasiswa
+    for i, mhs_id in enumerate(df_mahasiswa["id_mahasiswa"]):
+        # Dapatkan indeks top-k rekomendasi
+        idx_top = np.argsort(hybrid_scores[i])[::-1][:k]
+        # Simpan daftar ID komunitas yang direkomendasikan
+        recommendations[mhs_id] = [df_komunitas["id_komunitas"].iloc[idx] for idx in idx_top]
+    
+    # Hitung MAP
+    map_score = calculate_map(ground_truth, recommendations, k)
+    
+    # Hitung Precision@k rata-rata
+    avg_precision = np.mean([
+        calculate_precision_at_k(ground_truth[user_id], recommendations[user_id], k)
+        for user_id in ground_truth.keys() if user_id in recommendations
+    ])
+    
+    # Tampilkan jumlah item yang relevan untuk setiap pengguna
+    relevant_items = {user_id: len(items) for user_id, items in ground_truth.items()}
+    
+    # Hapus pengguna tanpa item yang relevan dari perhitungan
+    valid_users = [user_id for user_id in ground_truth.keys() if len(ground_truth[user_id]) > 0]
+    if valid_users:
+        map_valid = calculate_map({user_id: ground_truth[user_id] for user_id in valid_users}, 
+                                recommendations, k)
+    else:
+        map_valid = 0
+    
+    return {
+        "MAP": map_score,
+        "MAP (valid users)": map_valid,
+        "Avg Precision@k": avg_precision,
+        "k": k,
+        "Valid Users": len(valid_users),
+        "Total Users": len(ground_truth),
+        "Avg Communities Joined": np.mean(list(relevant_items.values())),
+        "Min Communities Joined": min(relevant_items.values()) if relevant_items else 0,
+        "Max Communities Joined": max(relevant_items.values()) if relevant_items else 0
+    }
+
+
+def evaluate_recommendations(df_mahasiswa, df_komunitas, hybrid_scores, k=5, rating_threshold=3.0):
+    """
+    Mengevaluasi hasil rekomendasi menggunakan Mean Average Precision (MAP)
+    
+    Args:
+        df_mahasiswa: DataFrame yang berisi data mahasiswa dan rating
+        df_komunitas: DataFrame yang berisi data komunitas
+        hybrid_scores: Matrix skor hasil hybrid filtering
+        k: Jumlah top rekomendasi yang dievaluasi
+        rating_threshold: Batas rating untuk dianggap relevan
+        
+    Returns:
+        Dictionary berisi metrik evaluasi
+    """
+    # Siapkan ground truth - komunitas yang disukai oleh setiap pengguna
+    ground_truth = prepare_ground_truth(df_mahasiswa, threshold=rating_threshold)
+    
+    # Siapkan hasil rekomendasi untuk setiap pengguna
+    recommendations = {}
+    
+    # Untuk setiap mahasiswa
+    for i, mhs_id in enumerate(df_mahasiswa["id_mahasiswa"]):
+        # Dapatkan indeks top-k rekomendasi
+        idx_top = np.argsort(hybrid_scores[i])[::-1][:k]
+        # Simpan daftar ID komunitas yang direkomendasikan
+        recommendations[mhs_id] = [df_komunitas["id_komunitas"].iloc[idx] for idx in idx_top]
+    
+    # Hitung MAP
+    map_score = calculate_map(ground_truth, recommendations, k)
+    
+    # Hitung Precision@k rata-rata
+    avg_precision = np.mean([
+        calculate_precision_at_k(ground_truth[user_id], recommendations[user_id], k)
+        for user_id in ground_truth.keys() if user_id in recommendations
+    ])
+    
+    # Tampilkan jumlah item yang relevan untuk setiap pengguna
+    relevant_items = {user_id: len(items) for user_id, items in ground_truth.items()}
+    
+    # Hapus pengguna tanpa item yang relevan dari perhitungan
+    valid_users = [user_id for user_id in ground_truth.keys() if len(ground_truth[user_id]) > 0]
+    if valid_users:
+        map_valid = calculate_map({user_id: ground_truth[user_id] for user_id in valid_users}, 
+                                recommendations, k)
+    else:
+        map_valid = 0
+    
+    return {
+        "MAP": map_score,
+        "MAP (valid users)": map_valid,
+        "Avg Precision@k": avg_precision,
+        "k": k,
+        "Rating Threshold": rating_threshold,
+        "Valid Users": len(valid_users),
+        "Total Users": len(ground_truth),
+        "Avg Relevant Items": np.mean(list(relevant_items.values())),
+        "Min Relevant Items": min(relevant_items.values()) if relevant_items else 0,
+        "Max Relevant Items": max(relevant_items.values()) if relevant_items else 0
+    }
+# Tambahkan setelah bagian "=== 5. GENERATE RECOMMENDATIONS ==="
+# ... setelah bagian st.download_button
+
+# === 5.1 EVALUASI REKOMENDASI ===
+if df_mahasiswa is not None and len(df_mahasiswa) > 1:  # Evaluasi jika ada minimal 2 mahasiswa
+    st.subheader("5️⃣ Evaluasi Hasil Rekomendasi")
+    
+    with st.expander("Evaluasi dengan Mean Average Precision (MAP)"):
+        # Buat radio button untuk memilih sumber ground truth
+        ground_truth_source = st.radio(
+            "Pilih sumber ground truth:",
+            ["Rating Komunitas", "Komunitas yang Diikuti"],
+            help="Ground truth adalah data faktual yang digunakan sebagai dasar evaluasi"
+        )
+        
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            eval_k = st.slider("Jumlah Rekomendasi (k)", 1, 10, 5, 
+                              help="Jumlah rekomendasi teratas yang akan dievaluasi")
+        
+        with col2:
+            if ground_truth_source == "Rating Komunitas":
+                threshold = st.slider("Rating Threshold", 0.0, 5.0, 3.0, 0.5,
+                                     help="Rating minimal untuk dianggap sebagai item yang relevan")
+                take_first_only = False  # Tidak digunakan untuk rating
+            else:
+                # Jika menggunakan komunitas yang diikuti, pilih kolom yang berisi data tersebut
+                community_columns = [col for col in df_mahasiswa.columns if 'komunitas' in col.lower() or 'community' in col.lower()]
+                if not community_columns:
+                    community_columns = ["Tidak ada kolom komunitas yang terdeteksi"]
+                community_column = st.selectbox("Kolom Komunitas yang Diikuti", community_columns)
+        
+        with col3:
+            if ground_truth_source == "Komunitas yang Diikuti":
+                take_first_only = st.checkbox("Gunakan Hanya Komunitas Pertama", value=True,
+                                            help="Jika dicentang, hanya komunitas pertama dari daftar yang akan digunakan sebagai ground truth")
+        
+        if st.button("Evaluasi Kinerja Rekomendasi"):
+            with st.spinner("Menghitung metrik evaluasi..."):
+                # Siapkan rekomendasi untuk semua pengguna
+                recommendations = {}
+                for i, mhs_id in enumerate(df_mahasiswa["id_mahasiswa"]):
+                    idx_top = np.argsort(hybrid_scores[i])[::-1][:eval_k]
+                    recommendations[mhs_id] = [df_komunitas["id_komunitas"].iloc[idx] for idx in idx_top]
+                
+                # Pilih metode evaluasi berdasarkan sumber ground truth
+                if ground_truth_source == "Rating Komunitas":
+                    # Siapkan ground truth dari rating
+                    ground_truth = prepare_ground_truth(df_mahasiswa, threshold=threshold)
+                    evaluation_results = evaluate_recommendations(
+                        df_mahasiswa, df_komunitas, hybrid_scores, 
+                        k=eval_k, rating_threshold=threshold
+                    )
+                    gt_description = f"Rating ≥ {threshold}"
+                else:
+                    # Pastikan kolom komunitas yang dipilih ada di DataFrame
+                    if community_column in df_mahasiswa.columns:
+                        # Siapkan ground truth dari komunitas yang diikuti
+                        ground_truth = prepare_ground_truth_from_joined(
+                            df_mahasiswa, community_column, take_first_only
+                        )
+                        evaluation_results = evaluate_recommendations_from_joined(
+                            df_mahasiswa, df_komunitas, hybrid_scores, 
+                            community_column, k=eval_k, take_first_only=take_first_only
+                        )
+                        gt_description = f"{'Komunitas Pertama yang Diikuti' if take_first_only else 'Semua Komunitas yang Diikuti'}"
+                    else:
+                        st.error(f"Kolom '{community_column}' tidak ditemukan dalam data mahasiswa.")
+                        st.stop()
+                
+                # Tampilkan hasil evaluasi
+                st.success("✅ Evaluasi selesai!")
+                
+                # Tampilkan metrik utama
+                metrics_col1, metrics_col2, metrics_col3 = st.columns(3)
+                with metrics_col1:
+                    st.metric("Mean Average Precision (MAP)", f"{evaluation_results['MAP']:.4f}")
+                with metrics_col2:
+                    st.metric("MAP (valid users)", f"{evaluation_results['MAP (valid users)']:.4f}")
+                with metrics_col3:
+                    st.metric("Avg Precision@k", f"{evaluation_results['Avg Precision@k']:.4f}")
+                
+                # Tampilkan statistik lain
+                st.write("**Detail Statistik:**")
+                detail_df = pd.DataFrame({
+                    "Metrik": ["Jumlah Pengguna", "Pengguna dengan Data Relevan", 
+                              "Rata-rata Komunitas Relevan", "Min Komunitas Relevan", "Max Komunitas Relevan"],
+                    "Nilai": [
+                        evaluation_results["Total Users"],
+                        evaluation_results["Valid Users"],
+                        f"{evaluation_results.get('Avg Communities Joined', evaluation_results.get('Avg Relevant Items', 0)):.2f}",
+                        evaluation_results.get("Min Communities Joined", evaluation_results.get("Min Relevant Items", 0)),
+                        evaluation_results.get("Max Communities Joined", evaluation_results.get("Max Relevant Items", 0))
+                    ]
+                })
+                st.table(detail_df)
+                
+                # Penjelasan hasil
+                st.info(f"""
+                **Interpretasi Hasil:**
+                
+                Mean Average Precision (MAP) bernilai {evaluation_results['MAP']:.4f} 
+                menunjukkan keakuratan sistem dalam merekomendasikan komunitas yang relevan bagi pengguna.
+                
+                Ground Truth: {gt_description}
+                
+                - MAP = 0 berarti sistem tidak merekomendasikan komunitas yang relevan sama sekali
+                - MAP = 1 berarti sistem memberikan peringkat sempurna (semua rekomendasi relevan)
+                - MAP {evaluation_results['MAP']:.4f} menunjukkan bahwa sistem mampu memberikan rekomendasi dengan tingkat akurasi ini
+                
+                Precision@{evaluation_results['k']} rata-rata sebesar {evaluation_results['Avg Precision@k']:.4f} 
+                menunjukkan proporsi rekomendasi yang relevan dari {evaluation_results['k']} rekomendasi teratas.
+                """)
+                
+                # Tampilkan visualisasi (opsional)
+                if evaluation_results["Valid Users"] > 0:
+                    st.subheader("Visualisasi Hasil Evaluasi")
+                    
+                    # Visualisasikan MAP per pengguna jika ada banyak pengguna
+                    if len(df_mahasiswa) > 5:
+                        # Hitung AP untuk setiap pengguna
+                        user_aps = {}
+                        for user_id in ground_truth.keys():
+                            if user_id in recommendations and len(ground_truth[user_id]) > 0:
+                                ap = calculate_average_precision(ground_truth[user_id], recommendations[user_id], eval_k)
+                                user_aps[user_id] = ap
+                        
+                        # Visualisasikan distribusi AP
+                        fig, ax = plt.subplots(figsize=(10, 5))
+                        user_names = [df_mahasiswa.loc[df_mahasiswa['id_mahasiswa'] == uid, 'nama_mahasiswa'].iloc[0] if uid in df_mahasiswa['id_mahasiswa'].values else uid for uid in user_aps.keys()]
+                        ap_values = list(user_aps.values())
+                        
+                        # Plot histogram atau bar chart tergantung jumlah pengguna
+                        if len(user_aps) > 10:
+                            sns.histplot(ap_values, bins=10, kde=True, ax=ax)
+                            ax.set_title('Distribusi Average Precision')
+                            ax.set_xlabel('Average Precision')
+                            ax.set_ylabel('Jumlah Pengguna')
+                        else:
+                            # Sort berdasarkan AP value
+                            sorted_indices = np.argsort(ap_values)[::-1]
+                            sorted_names = [user_names[i] for i in sorted_indices]
+                            sorted_aps = [ap_values[i] for i in sorted_indices]
+                            
+                            # Plot bar chart
+                            ax.bar(range(len(sorted_names)), sorted_aps, color='skyblue')
+                            ax.set_xticks(range(len(sorted_names)))
+                            ax.set_xticklabels(sorted_names, rotation=45, ha='right')
+                            ax.set_title('Average Precision per Pengguna')
+                            ax.set_xlabel('Pengguna')
+                            ax.set_ylabel('Average Precision')
+                            ax.axhline(y=evaluation_results['MAP'], color='red', linestyle='--', label=f"MAP: {evaluation_results['MAP']:.4f}")
+                            ax.legend()
+                        
+                        st.pyplot(fig)
+
+else:
+    st.subheader("5️⃣.1 Evaluasi Hasil Rekomendasi")
+    st.warning("⚠️ Evaluasi membutuhkan minimal 2 mahasiswa. Silakan tambahkan lebih banyak data mahasiswa terlebih dahulu.")
+
